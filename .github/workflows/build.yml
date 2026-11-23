@@ -20,7 +20,8 @@ jobs:
           import org.geysermc.mcprotocollib.network.event.session.DisconnectedEvent;
           import org.geysermc.mcprotocollib.network.event.session.SessionAdapter;
           import org.geysermc.mcprotocollib.network.packet.Packet;
-          import org.geysermc.mcprotocollib.network.tcp.TcpClientSession;
+          import org.geysermc.mcprotocollib.network.ClientSession;
+          import org.geysermc.mcprotocollib.network.factory.ClientNetworkSessionFactory;
           import org.geysermc.mcprotocollib.protocol.MinecraftProtocol;
           import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundLoginPacket;
           import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundSystemChatPacket;
@@ -28,6 +29,7 @@ jobs:
           import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundChatPacket;
           import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerRotPacket;
 
+          import java.net.InetSocketAddress;
           import java.time.Instant;
           import java.util.ArrayList;
           import java.util.BitSet;
@@ -128,7 +130,10 @@ jobs:
                   log("* Lacze jako " + name + " -> " + h + ":" + port);
 
                   // tryb offline: sam nick, bez konta Microsoft
-                  Session s = new TcpClientSession(h, port, new MinecraftProtocol(name));
+                  ClientSession s = ClientNetworkSessionFactory.factory()
+                          .setRemoteSocketAddress(new InetSocketAddress(h, port))
+                          .setProtocol(new MinecraftProtocol(name))
+                          .create();
                   s.addListener(new SessionAdapter() {
                       @Override
                       public void packetReceived(Session ses, Packet packet) {
