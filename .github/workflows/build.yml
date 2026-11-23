@@ -1,1 +1,436 @@
+name: Build mod
+on:
+  push:
+  workflow_dispatch:
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate project files
+        run: |
+          set -e
+          mkdir -p src/main/java/dev/botmod
+          cat > src/main/java/dev/botmod/BotManager.java <<'__BOTMOD_EOF__'
+          package dev.botmod;
+
+          import net.kyori.adventure.text.Component;
+          import net.kyori.adventure.text.TextComponent;
+          import org.geysermc.mcprotocollib.network.Session;
+          import org.geysermc.mcprotocollib.network.event.session.DisconnectedEvent;
+          import org.geysermc.mcprotocollib.network.event.session.SessionAdapter;
+          import org.geysermc.mcprotocollib.network.packet.Packet;
+          import org.geysermc.mcprotocollib.network.tcp.TcpClientSession;
+          import org.geysermc.mcprotocollib.protocol.MinecraftProtocol;
+          import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundLoginPacket;
+          import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.ClientboundSystemChatPacket;
+          import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundChatCommandPacket;
+          import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundChatPacket;
+          import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerRotPacket;
+
+          import java.time.Instant;
+          import java.util.ArrayList;
+          import java.util.BitSet;
+          import java.util.List;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.ScheduledExecutorService;
+          import java.util.concurrent.TimeUnit;
+
+          /** Jeden bot. Dziala w tle, niezaleznie od Twojej gry. */
+          public final class BotManager {
+              public static final BotManager INSTANCE = new BotManager();
+
+              // Ostatnio wpisane dane (zostaja w pamieci do zamkniecia gry)
+              public volatile String host = "", name = "", password = "";
+
+              private final ScheduledExecutorService exec = Executors.newSingleThreadScheduledExecutor(r -> {
+                  Thread t = new Thread(r, "botmod");
+                  t.setDaemon(true);
+                  return t;
+              });
+              private final List<String> log = new ArrayList<>();
+
+              private volatile Session session;
+              private volatile boolean wanted;      // czy bot ma byc wlaczony (do auto-reconnect)
+              private volatile boolean inGame;      // czy dostal pakiet wejscia do gry
+              private boolean registerSent, loginSent;
+              private float yaw;
+
+              private BotManager() {
+                  // anty-AFK: co 25 s lekki obrot glowy
+                  exec.scheduleAtFixedRate(() -> {
+                      Session s = session;
+                      if (s != null && inGame && s.isConnected()) {
+                          yaw = (yaw + 15f) % 360f;
+                          s.send(new ServerboundMovePlayerRotPacket(true, false, yaw, 0f));
+                      }
+                  }, 25, 25, TimeUnit.SECONDS);
+              }
+
+              // ---------- log ----------
+              public synchronized void log(String line) {
+                  log.add(line);
+                  if (log.size() > 200) log.remove(0);
+              }
+
+              public synchronized List<String> tail(int n) {
+                  return new ArrayList<>(log.subList(Math.max(0, log.size() - n), log.size()));
+              }
+
+              public String status() {
+                  Session s = session;
+                  if (!wanted) return "wylaczony";
+                  if (s != null && s.isConnected()) return inGame ? "na serwerze" : "laczenie...";
+                  return "ponowne laczenie...";
+              }
+
+              // ---------- start / stop ----------
+              public void start(String host, String name, String password) {
+                  this.host = host.trim();
+                  this.name = name.trim();
+                  this.password = password;
+                  if (!this.name.matches("[A-Za-z0-9_]{3,16}")) {
+                      log("! Nick: 3-16 znakow, litery/cyfry/_");
+                      return;
+                  }
+                  if (this.host.isEmpty()) {
+                      log("! Wpisz adres serwera");
+                      return;
+                  }
+                  stop();
+                  wanted = true;
+                  exec.execute(this::connect);
+              }
+
+              public void stop() {
+                  wanted = false;
+                  inGame = false;
+                  Session s = session;
+                  session = null;
+                  if (s != null) s.disconnect("stop");
+                  log("* Bot wylaczony");
+              }
+
+              private void connect() {
+                  if (!wanted) return;
+                  String h = host;
+                  int port = 25565;
+                  int i = h.lastIndexOf(':');
+                  if (i > 0) {
+                      try {
+                          port = Integer.parseInt(h.substring(i + 1));
+                          h = h.substring(0, i);
+                      } catch (NumberFormatException ignored) {
+                      }
+                  }
+                  registerSent = loginSent = false;
+                  inGame = false;
+                  log("* Lacze jako " + name + " -> " + h + ":" + port);
+
+                  // tryb offline: sam nick, bez konta Microsoft
+                  Session s = new TcpClientSession(h, port, new MinecraftProtocol(name));
+                  s.addListener(new SessionAdapter() {
+                      @Override
+                      public void packetReceived(Session ses, Packet packet) {
+                          if (packet instanceof ClientboundLoginPacket) {
+                              inGame = true;
+                              log("* Bot wszedl na serwer");
+                          } else if (packet instanceof ClientboundSystemChatPacket chat) {
+                              String text = plain(chat.getContent());
+                              log(text);
+                              autoAuth(ses, text);
+                          }
+                      }
+
+                      @Override
+                      public void disconnected(DisconnectedEvent event) {
+                          inGame = false;
+                          log("* Rozlaczono: " + plain(event.getReason()));
+                          if (wanted) {
+                              log("* Ponowne laczenie za 10 s");
+                              exec.schedule(BotManager.this::connect, 10, TimeUnit.SECONDS);
+                          }
+                      }
+                  });
+                  session = s;
+                  s.connect();
+              }
+
+              // ---------- automatyczne /register i /login (tylko gdy podasz haslo) ----------
+              private void autoAuth(Session s, String text) {
+                  if (password.isEmpty()) return;
+                  String low = text.toLowerCase();
+                  if (low.contains("/register") && !registerSent) {
+                      registerSent = true;
+                      exec.schedule(() -> s.send(new ServerboundChatCommandPacket("register " + password + " " + password)),
+                              1, TimeUnit.SECONDS);
+                      log("* Wyslano /register ***");
+                  } else if (low.contains("/login") && !loginSent) {
+                      loginSent = true;
+                      exec.schedule(() -> s.send(new ServerboundChatCommandPacket("login " + password)), 1, TimeUnit.SECONDS);
+                      log("* Wyslano /login ***");
+                  }
+              }
+
+              // ---------- reczne sterowanie czatem bota ----------
+              public void say(String msg) {
+                  Session s = session;
+                  if (s == null || !inGame || !s.isConnected()) {
+                      log("! Bot nie jest na serwerze");
+                      return;
+                  }
+                  msg = msg.trim();
+                  if (msg.isEmpty()) return;
+                  if (msg.startsWith("/")) {
+                      String cmd = msg.substring(1);
+                      String lc = cmd.toLowerCase();
+                      boolean secret = lc.startsWith("register") || lc.startsWith("login") || lc.startsWith("changepassword");
+                      s.send(new ServerboundChatCommandPacket(cmd));
+                      log("> " + (secret ? "/" + cmd.split(" ")[0] + " ***" : msg));
+                  } else {
+                      // UWAGA: sygnatura moze sie roznic miedzy wersjami MCProtocolLib
+                      s.send(new ServerboundChatPacket(msg, Instant.now().toEpochMilli(), 0L, null, 0, new BitSet(), (byte) 0));
+                      log("> " + msg);
+                  }
+              }
+
+              // ---------- pomocnicze ----------
+              static String plain(Component c) {
+                  if (c == null) return "";
+                  StringBuilder sb = new StringBuilder();
+                  if (c instanceof TextComponent t) sb.append(t.content());
+                  for (Component child : c.children()) sb.append(plain(child));
+                  return sb.toString();
+              }
+
+              static String plain(String s) {
+                  return s == null ? "" : s;
+              }
+          }
+          __BOTMOD_EOF__
+          mkdir -p src/main/java/dev/botmod
+          cat > src/main/java/dev/botmod/BotScreen.java <<'__BOTMOD_EOF__'
+          package dev.botmod;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          import java.util.List;
+
+          public class BotScreen extends Screen {
+              private final Screen parent;
+              private EditBox hostBox, nameBox, passBox, chatBox;
+
+              public BotScreen(Screen parent) {
+                  super(Component.literal("Bot"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  BotManager bm = BotManager.INSTANCE;
+                  int cx = width / 2, w = 300, x = cx - w / 2;
+
+                  hostBox = new EditBox(font, x, 28, w, 18, Component.literal("Serwer"));
+                  hostBox.setMaxLength(100);
+                  hostBox.setValue(bm.host);
+                  hostBox.setHint(Component.literal("Adres serwera (np. mc.serwer.pl:25565)"));
+                  addRenderableWidget(hostBox);
+
+                  nameBox = new EditBox(font, x, 52, 145, 18, Component.literal("Nick"));
+                  nameBox.setMaxLength(16);
+                  nameBox.setValue(bm.name);
+                  nameBox.setHint(Component.literal("Nick bota"));
+                  addRenderableWidget(nameBox);
+
+                  passBox = new EditBox(font, x + 155, 52, 145, 18, Component.literal("Haslo"));
+                  passBox.setMaxLength(64);
+                  passBox.setValue(bm.password);
+                  passBox.setHint(Component.literal("Haslo (14 znakow)"));
+                  addRenderableWidget(passBox);
+
+                  addRenderableWidget(Button.builder(Component.literal("Start"), b ->
+                          bm.start(hostBox.getValue(), nameBox.getValue(), passBox.getValue()))
+                          .bounds(x, 76, 98, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal("Stop"), b -> bm.stop())
+                          .bounds(x + 101, 76, 98, 20).build());
+                  addRenderableWidget(Button.builder(Component.literal("Zamknij"), b -> onClose())
+                          .bounds(x + 202, 76, 98, 20).build());
+
+                  chatBox = new EditBox(font, x, height - 30, 240, 18, Component.literal("Czat"));
+                  chatBox.setMaxLength(256);
+                  chatBox.setHint(Component.literal("Czat bota (zacznij od / dla komendy)"));
+                  addRenderableWidget(chatBox);
+
+                  addRenderableWidget(Button.builder(Component.literal("Wyslij"), b -> {
+                      bm.say(chatBox.getValue());
+                      chatBox.setValue("");
+                  }).bounds(x + 244, height - 31, 56, 20).build());
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+                  super.render(g, mouseX, mouseY, delta);
+                  BotManager bm = BotManager.INSTANCE;
+                  int x = width / 2 - 150;
+                  g.drawString(font, "Status: " + bm.status(), x, 104, 0xFFFFFFFF);
+
+                  int lines = Math.max(1, (height - 30 - 124) / 10);
+                  List<String> tail = bm.tail(lines);
+                  int y = 120;
+                  for (String s : tail) {
+                      String line = font.plainSubstrByWidth(s, 300);
+                      g.drawString(font, line, x, y, 0xFFCCCCCC);
+                      y += 10;
+                  }
+              }
+
+              @Override
+              public void onClose() {
+                  // zapamietaj wpisane dane
+                  BotManager.INSTANCE.host = hostBox.getValue();
+                  BotManager.INSTANCE.name = nameBox.getValue();
+                  BotManager.INSTANCE.password = passBox.getValue();
+                  minecraft.setScreen(parent);
+              }
+
+              @Override
+              public boolean isPauseScreen() {
+                  return false;
+              }
+          }
+          __BOTMOD_EOF__
+          mkdir -p src/main/java/dev/botmod
+          cat > src/main/java/dev/botmod/BotModClient.java <<'__BOTMOD_EOF__'
+          package dev.botmod;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+          import net.fabricmc.fabric.api.client.screen.v1.Screens;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.PauseScreen;
+          import net.minecraft.client.gui.screens.TitleScreen;
+          import net.minecraft.client.gui.screens.multiplayer.JoinMultiplayerScreen;
+          import net.minecraft.network.chat.Component;
+
+          public class BotModClient implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  // Przycisk "Bot" w lewym gornym rogu: menu glowne, lista serwerow i menu pauzy
+                  ScreenEvents.AFTER_INIT.register((client, screen, w, h) -> {
+                      if (screen instanceof TitleScreen || screen instanceof JoinMultiplayerScreen || screen instanceof PauseScreen) {
+                          Screens.getButtons(screen).add(
+                                  Button.builder(Component.literal("Bot"), b -> client.setScreen(new BotScreen(screen)))
+                                          .bounds(5, 5, 50, 20).build());
+                      }
+                  });
+              }
+          }
+          __BOTMOD_EOF__
+          cat > settings.gradle <<'__BOTMOD_EOF__'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'botmod'
+          __BOTMOD_EOF__
+          cat > gradle.properties <<'__BOTMOD_EOF__'
+          org.gradle.jvmargs=-Xmx2G
+          minecraft_version=1.21.11
+          loader_version=0.18.4
+          fabric_api_version=0.141.1+1.21.11
+          mod_version=1.0.0
+          maven_group=dev.botmod
+          archives_base_name=botmod
+          __BOTMOD_EOF__
+          cat > build.gradle <<'__BOTMOD_EOF__'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+              id 'com.gradleup.shadow' version '9.0.0'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          repositories {
+              maven { url = 'https://repo.opencollab.dev/maven-releases/' }
+          }
+
+          configurations {
+              bundled
+              implementation.extendsFrom bundled
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+              bundled "org.geysermc.mcprotocollib:protocol:1.21.11-+"
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+
+          shadowJar {
+              configurations = [project.configurations.bundled]
+              archiveClassifier = 'dev-shadow'
+              dependencies {
+                  exclude(dependency('io.netty:.*'))
+                  exclude(dependency('org.slf4j:.*'))
+                  exclude(dependency('org.apache.logging.log4j:.*'))
+              }
+              mergeServiceFiles()
+          }
+
+          remapJar {
+              dependsOn shadowJar
+              inputFile.set(shadowJar.archiveFile)
+          }
+          __BOTMOD_EOF__
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'__BOTMOD_EOF__'
+          {
+            "schemaVersion": 1,
+            "id": "botmod",
+            "version": "1.0.0",
+            "name": "BotMod",
+            "description": "Przycisk uruchamiajacy bota (tryb offline) na serwerze, ktory na to pozwala.",
+            "environment": "client",
+            "entrypoints": { "client": ["dev.botmod.BotModClient"] },
+            "depends": {
+              "fabricloader": ">=0.18.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          __BOTMOD_EOF__
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: botmod
+          path: build/libs/botmod-1.0.0.jar
